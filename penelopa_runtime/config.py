@@ -96,12 +96,17 @@ def bootstrap(home: Path) -> None:
     """A root-only, exact-path migration for old root-owned per-user volumes."""
     if home.is_symlink() or home.parent.is_symlink():
         raise ValueError("Managed runtime directories must not be symlinks")
+    workspace = home.parent / "workspace"
+    if workspace.is_symlink():
+        raise ValueError("Managed workspace must not be a symlink")
     home.parent.mkdir(parents=True, exist_ok=True)
     home.mkdir(exist_ok=True)
+    workspace.mkdir(exist_ok=True)
     if os.geteuid() == 0:
         for path in (
             home.parent,
             home,
+            workspace,
             home.parent / "runtime.json",
             home.parent / "pending_terminal.json",
         ):

@@ -1,6 +1,7 @@
 """Transport/lifecycle unit tests; no upstream installation or real credentials."""
 
 import json
+import os
 import tempfile
 import threading
 import time
@@ -11,7 +12,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from penelopa_runtime.broker import Broker, CapabilityRevoked, TransportError, exchange
-from penelopa_runtime.config import Settings, endpoint
+from penelopa_runtime.config import Settings, bootstrap, endpoint
 from penelopa_runtime.state import RuntimeState, atomic_json
 
 
@@ -31,6 +32,39 @@ def settings(root):
         provider_token="test-provider-secret",
         home=home,
     )
+
+
+class BootstrapUnit(unittest.TestCase):
+    def test_nonroot_bootstrap_creates_and_preserves_dedicated_workspace(self):
+        with (
+            tempfile.TemporaryDirectory() as root,
+            patch.dict(os.environ),
+            patch("penelopa_runtime.config.os.geteuid", return_value=10001),
+        ):
+            home = Path(root) / "hermes"
+            previous_cwd = Path.cwd()
+            bootstrap(home)
+            workspace = Path(root) / "workspace"
+            self.assertTrue(workspace.is_dir())
+            self.assertNotEqual(workspace, home)
+            retained = workspace / "retained.txt"
+            retained.write_text("keep existing user data")
+            bootstrap(home)
+            self.assertEqual(retained.read_text(), "keep existing user data")
+            self.assertEqual(Path.cwd(), previous_cwd)
+
+    def test_nonroot_bootstrap_rejects_workspace_symlink(self):
+        with (
+            tempfile.TemporaryDirectory() as root,
+            patch.dict(os.environ),
+            patch("penelopa_runtime.config.os.geteuid", return_value=10001),
+        ):
+            outside = Path(root) / "outside"
+            outside.mkdir()
+            (Path(root) / "workspace").symlink_to(outside, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, "workspace.*symlink"):
+                bootstrap(Path(root) / "hermes")
+            self.assertEqual(list(outside.iterdir()), [])
 
 
 class RuntimeUnit(unittest.TestCase):
