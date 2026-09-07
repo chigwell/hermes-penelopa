@@ -1,0 +1,51 @@
+name: Verify and publish native Hermes runtime
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: hermes-runtime-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify-and-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      HERMES_TEST_IMAGE: ghcr.io/chigwell/hermes-penelopa:${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Static checks
+        run: |
+          python -m pip install pre-commit
+          pre-commit run --all-files
+      - name: Build immutable candidate once
+        run: docker build --pull --label org.opencontainers.image.revision=${{ github.sha }} -t "$HERMES_TEST_IMAGE" .
+      - name: Test routing, deadlines, claim fencing and telemetry
+        run: python -m unittest discover -s tests -p test_runtime_unit.py -v
+      - name: Verify actual upstream imports and security contracts
+        run: docker run --rm --network none --entrypoint /opt/hermes/.venv/bin/python "$HERMES_TEST_IMAGE" -m unittest discover -s /opt/penelopa/tests -p test_native_contract.py -v
+      - name: Test actual harness, MCP, persistent volumes and delayed learning
+        run: python -m unittest discover -s tests -p test_container_integration.py -v
+      - name: Login to GHCR
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish the tested image without rebuilding
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        run: |
+          docker push "$HERMES_TEST_IMAGE"
+          docker inspect "$HERMES_TEST_IMAGE" --format '{{join .RepoDigests "\n"}}' >> "$GITHUB_STEP_SUMMARY"
