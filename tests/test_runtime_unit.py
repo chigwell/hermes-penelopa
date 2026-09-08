@@ -9,10 +9,12 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from penelopa_runtime.broker import Broker, CapabilityRevoked, TransportError, exchange
 from penelopa_runtime.config import Settings, bootstrap, endpoint
+from penelopa_runtime.improvement import review_messages
 from penelopa_runtime.state import RuntimeState, atomic_json
 
 
@@ -68,6 +70,15 @@ class BootstrapUnit(unittest.TestCase):
 
 
 class RuntimeUnit(unittest.TestCase):
+    def test_large_history_advances_only_reviewed_prefix(self):
+        brief = {"context": [], "native_sessions": [
+            {"task_id": "first", "session_id": "a", "offset": 0},
+            {"task_id": "second", "session_id": "b", "offset": 0}]}
+        db = SimpleNamespace(get_messages=lambda _: [{"role": "user", "content": "x" * 30000}])
+        messages, progress = review_messages(brief, db)
+        self.assertEqual(progress, {"first": 12000})
+        self.assertEqual(len(messages), 2)
+
     def test_maintenance_budget_survives_restart_and_bounds_each_call(self):
         brief = {"task_kind": "self_improvement", "deadline": (datetime.now(timezone.utc) + timedelta(seconds=180)).isoformat(),
             "budget": {"calls": 2, "input_tokens": 100000, "output_tokens": 8000}}
