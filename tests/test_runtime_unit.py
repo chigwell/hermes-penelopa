@@ -94,6 +94,17 @@ class RuntimeUnit(unittest.TestCase):
         self.assertEqual(self.state.error_code, "budget_exhausted")
         self.assertNotIn("submit_recommendations", restarted.allowed_tools())
 
+    def test_inconsistent_provider_usage_cannot_reopen_input_budget(self):
+        self.broker.configure_task({"task_kind": "self_improvement",
+            "deadline": (datetime.now(timezone.utc) + timedelta(seconds=180)).isoformat(),
+            "budget": {"calls": 8, "input_tokens": 100000, "output_tokens": 8000}})
+        usage = {"prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 90010}
+        with patch("penelopa_runtime.broker.exchange", return_value=(200, {}, json.dumps({"usage": usage}).encode())):
+            self.broker.provider("/provider/background_review/v1/chat/completions", {"model": "primary"})
+        self.assertEqual(self.broker.reserved["input_tokens"], 90000)
+        with self.assertRaises(TransportError):
+            self.broker.reserve_call({"messages": [{"role": "user", "content": "x" * 12000}]})
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

@@ -498,7 +498,14 @@ class Broker:
                 pass
             self.state.record(stage, model, time.monotonic() - started, usage=usage)
             if self.budget and isinstance(usage, dict) and all(type(usage.get(k)) is int and usage[k] >= 0 for k in ("prompt_tokens", "completion_tokens")):
-                self.reserved["input_tokens"] = reserved_before["input_tokens"] + usage["prompt_tokens"]
+                reported_input = usage["prompt_tokens"]
+                total = usage.get("total_tokens")
+                inconsistent = type(total) is int and total != reported_input + usage["completion_tokens"]
+                if inconsistent:
+                    # Some providers exclude cached input from prompt_tokens.
+                    reported_input = max(reported_input, total - usage["completion_tokens"])
+                reconciled = reserved_before["input_tokens"] + reported_input
+                self.reserved["input_tokens"] = max(self.reserved["input_tokens"], reconciled) if inconsistent else reconciled
                 self.reserved["output_tokens"] = reserved_before["output_tokens"] + usage["completion_tokens"]
                 atomic_json(self.settings.home / "penelopa-review-budget.json", {"task_id": self.settings.task_id,
                     "claim_version": self.settings.claim_version, "reserved": self.reserved})
