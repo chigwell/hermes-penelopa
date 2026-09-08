@@ -115,6 +115,50 @@ class Broker:
         self.lease_deadline = time.monotonic() + min(settings.internal_timeout, 30)
         self.done = threading.Event()
         self.pending_path = settings.home.parent / "pending_terminal.json"
+        self.task_kind = "recommendation_generation"
+        self.budget = None
+        self.budget_lock = threading.RLock()
+        self.budget_deadline = None
+        self.reserved = {"calls": 0, "input_tokens": 0, "output_tokens": 0}
+
+    def configure_task(self, brief):
+        self.task_kind = brief.get("task_kind", "recommendation_generation")
+        if self.task_kind != "self_improvement":
+            return
+        self.budget = brief["budget"]
+        deadline = datetime.fromisoformat(brief["deadline"])
+        self.budget_deadline = time.monotonic() + max(0, (deadline - datetime.now(timezone.utc)).total_seconds())
+        path = self.settings.home / "penelopa-review-budget.json"
+        if path.is_symlink():
+            raise ValueError("budget_checkpoint_symlink")
+        old = json.loads(path.read_text()) if path.exists() else {}
+        if old.get("task_id") == self.settings.task_id and old.get("claim_version") == self.settings.claim_version:
+            self.reserved = old["reserved"]
+
+    def reserve_call(self, payload):
+        if self.budget is None:
+            return payload
+        # UTF-8 bytes conservatively bound tokenized input; reserve output before
+        # dispatch so transport failures and missing usage cannot reopen budget.
+        input_size = len(json.dumps(payload, ensure_ascii=False).encode()) + 1024
+        output = min(2048, int(payload.get("max_tokens") or payload.get("max_completion_tokens") or 2048),
+            self.budget["output_tokens"] - self.reserved["output_tokens"])
+        if (time.monotonic() >= self.budget_deadline or output < 1 or
+            self.reserved["calls"] >= self.budget["calls"] or
+            self.reserved["input_tokens"] + input_size > self.budget["input_tokens"]):
+            self.state.checkpoint(error_code="budget_exhausted")
+            self.state.stop.set()
+            raise TransportError("budget_exhausted")
+        self.reserved = {"calls": self.reserved["calls"] + 1,
+            "input_tokens": self.reserved["input_tokens"] + input_size,
+            "output_tokens": self.reserved["output_tokens"] + output}
+        atomic_json(self.settings.home / "penelopa-review-budget.json", {"task_id": self.settings.task_id,
+            "claim_version": self.settings.claim_version, "reserved": self.reserved})
+        result = {**payload, "stream": False}
+        result.pop("stream_options", None)
+        result.pop("max_completion_tokens", None)
+        result["max_tokens"] = output
+        return result
 
     def start(self):
         self.server_thread.start()
@@ -202,6 +246,10 @@ class Broker:
 
     def lease_watchdog(self):
         while not self.done.wait(0.1):
+            if self.budget_deadline is not None and time.monotonic() >= self.budget_deadline:
+                self.state.checkpoint(error_code="budget_exhausted")
+                self.state.stop.set()
+                return
             if self.state.accepted is None and time.monotonic() >= self.lease_deadline:
                 self.state.checkpoint(error_code="task_lease_expired")
                 self.state.stop.set()
@@ -328,20 +376,20 @@ class Broker:
                 return rpc_error(request_id, "Tool discovery unavailable")
             tools = response.get("result", {}).get("tools", [])
             response["result"] = {
-                "tools": [tool for tool in tools if tool.get("name") in MCP_TOOLS]
+                "tools": [tool for tool in tools if tool.get("name") in self.allowed_tools()]
             }
             return response
         params = message.get("params", {})
         name = params.get("name")
-        if name not in MCP_TOOLS:
+        if name not in self.allowed_tools():
             return rpc_error(request_id, "Tool is not permitted")
         if self.state.accepted is not None:
-            if name == "submit_recommendations":
+            if name in {"submit_recommendations", "complete_self_improvement"}:
                 return self.cached_terminal(request_id)
             return rpc_error(request_id, "Task already accepted; remote tools are closed")
         # The model cannot forge runner-owned telemetry/provenance.
         outgoing = {**message, "params": {"name": name, "arguments": params.get("arguments", {})}}
-        if name != "submit_recommendations":
+        if name not in {"submit_recommendations", "complete_self_improvement"}:
             return self.remote_rpc(outgoing)
         with self.terminal_lock:
             if self.state.accepted is not None:
@@ -390,7 +438,16 @@ class Broker:
             },
         }
 
+    def allowed_tools(self):
+        if self.task_kind == "self_improvement":
+            return {"get_task_brief", "complete_self_improvement"}
+        return MCP_TOOLS - {"complete_self_improvement"}
+
     def provider(self, path, payload):
+        with self.budget_lock:
+            return self._provider(path, payload)
+
+    def _provider(self, path, payload):
         if self.state.stop.is_set():
             raise TransportError("task_interrupted")
         stage = path.split("/")[2]
@@ -408,13 +465,15 @@ class Broker:
             raise TransportError("provider_model_denied")
         models = [payload["model"], *self.settings.fallback_models]
         for model in dict.fromkeys(models):
+            reserved_before = dict(self.reserved)
+            outgoing = self.reserve_call({**payload, "model": model})
             started = time.monotonic()
             try:
                 _, headers, raw = exchange(
                     f"{self.settings.provider_base}/chat/completions",
                     self.settings.provider_token,
-                    {**payload, "model": model},
-                    timeout=self.settings.provider_timeout,
+                    outgoing,
+                    timeout=min(self.settings.provider_timeout, max(0.1, self.budget_deadline - time.monotonic())) if self.budget_deadline else self.settings.provider_timeout,
                     headers={"X-Penelopa-Stage": stage},
                 )
             except TransportError as error:
@@ -438,6 +497,14 @@ class Broker:
             except (ValueError, AttributeError):
                 pass
             self.state.record(stage, model, time.monotonic() - started, usage=usage)
+            if self.budget and isinstance(usage, dict) and all(type(usage.get(k)) is int and usage[k] >= 0 for k in ("prompt_tokens", "completion_tokens")):
+                self.reserved["input_tokens"] = reserved_before["input_tokens"] + usage["prompt_tokens"]
+                self.reserved["output_tokens"] = reserved_before["output_tokens"] + usage["completion_tokens"]
+                atomic_json(self.settings.home / "penelopa-review-budget.json", {"task_id": self.settings.task_id,
+                    "claim_version": self.settings.claim_version, "reserved": self.reserved})
+                if any(self.reserved[key] >= self.budget[key] for key in ("input_tokens", "output_tokens")):
+                    self.state.checkpoint(error_code="budget_exhausted")
+                    self.state.stop.set()
             return headers.get("Content-Type", "application/json"), raw
         self.state.checkpoint(error_code="provider_chain_unavailable")
         self.state.stop.set()

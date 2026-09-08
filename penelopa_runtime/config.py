@@ -167,7 +167,7 @@ def write_managed_config(settings: Settings, broker: str) -> None:
         },
         "agent": {"max_turns": None, "run_budget_seconds": None, "environment_probe": False},
         "goals": {"max_turns": sys.maxsize},
-        "memory": {"memory_enabled": True, "user_profile_enabled": True},
+        "memory": {"memory_enabled": True, "user_profile_enabled": True, "write_approval": False},
         "skills": {
             "inline_shell": False,
             "external_dirs": [],
@@ -196,5 +196,18 @@ def write_managed_config(settings: Settings, broker: str) -> None:
     path = settings.home / "config.yaml"
     if path.is_symlink():
         raise ValueError("Managed config must not be a symlink")
+    existing = yaml.safe_load(path.read_text()) if path.exists() else {}
+    if existing is not None and not isinstance(existing, dict):
+        raise ValueError("Invalid managed config")
+    def merge(old, managed):
+        result = dict(old)
+        for key, value in managed.items():
+            result[key] = merge(result[key], value) if isinstance(value, dict) and isinstance(result.get(key), dict) else value
+        return result
+    config = merge(existing or {}, config)
+    # Only the managed MCP service and no plugins may survive old config.
+    config["plugins"] = {}
+    config["memory"].pop("provider", None)
+    config["mcp_servers"] = {"penelopa": config["mcp_servers"]["penelopa"]}
     path.write_text(yaml.safe_dump(config), encoding="utf-8")
     os.chmod(path, 0o600)

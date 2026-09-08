@@ -7,7 +7,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PUBLIC_TOOLS = (
@@ -42,6 +42,8 @@ class FixtureCase:
     heartbeats: list[dict] = field(default_factory=list)
     terminal_meta: dict = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
+    reports: list[dict] = field(default_factory=list)
+    maintenance: bool = False
 
     @property
     def sentinel(self):
@@ -133,6 +135,11 @@ class FixtureBackend:
                     case = self.case_for("provider")
                     if case:
                         self.provider(case, body)
+                elif self.path.endswith("/improvement-report"):
+                    case = self.case_for("lifecycle")
+                    if case:
+                        case.reports.append(body)
+                        self.respond({"recorded": True})
                 elif self.path.endswith("/runtime-heartbeat"):
                     case = self.case_for("lifecycle")
                     if case:
@@ -162,7 +169,7 @@ class FixtureBackend:
                     self.end_headers()
                     return
                 elif method == "tools/list":
-                    result = {"tools": [tool_schema(name) for name in PUBLIC_TOOLS] + [
+                    result = {"tools": [tool_schema(name) for name in (*PUBLIC_TOOLS, "complete_self_improvement")] + [
                         {**tool_schema(name), "_meta": {"hermes/internal": True}}
                         for name in ("heartbeat_task", "report_failure", "record_provider_model_usage")
                     ]}
@@ -176,6 +183,16 @@ class FixtureBackend:
                                 "analysis_goal": {"objective": "Inspect synthetic retained user work. "
                                                   "Submit a grounded recommendation or no_recommendation with reason."},
                                 "allowed_sessions": [{"id": case.session_id}], "learning_context": {}}
+                        if case.maintenance:
+                            data = {"task_id": case.task_id, "task_kind": "self_improvement",
+                                "deadline": (datetime.now(UTC) + timedelta(seconds=180)).isoformat(),
+                                "budget": {"seconds": 180, "calls": 8, "input_tokens": 100000, "output_tokens": 8000},
+                                "context": [{"kind": "feedback", "reason": case.review_sentinel}], "native_session_ids": []}
+                    elif name == "complete_self_improvement":
+                        assert case.maintenance and case.reports[-1]["complete"]
+                        case.terminal_calls += 1
+                        case.accepted.set()
+                        data = {"task_id": case.task_id, "status": "SUCCEEDED"}
                     elif name in {"list_user_sessions", "list_assigned_sessions"}:
                         data = {"sessions": [{"id": case.session_id}], "next_cursor": None}
                     elif name == "read_session_events":

@@ -16,5 +16,6 @@ MCP_TOOLS = frozenset(
         "remember_observation",
         "validate_recommendations",
         "submit_recommendations",
+        "complete_self_improvement",
     }
 )

@@ -11,6 +11,7 @@ from uuid import uuid4
 
 from penelopa_runtime.broker import Broker, CapabilityRevoked, TransportError
 from penelopa_runtime.config import Settings, bootstrap, write_managed_config
+from penelopa_runtime.improvement import Reporter, review_messages
 from penelopa_runtime.native import assert_surface, install_policy, run_terminal_review
 from penelopa_runtime.state import RuntimeState, atomic_json
 
@@ -51,6 +52,7 @@ def run(settings):
     db = None
     watcher_done = threading.Event()
     watcher = None
+    reporter = None
 
     def stop_handler(signum, frame):
         state.stop.set()
@@ -68,17 +70,23 @@ def run(settings):
             broker.heartbeat()
             return 0
         broker.await_initial_lease()
+        brief = broker.call("get_task_brief")
+        if str(brief.get("task_id")) != settings.task_id:
+            raise RuntimeError("task_brief_claim_mismatch")
+        broker.configure_task(brief)
+        maintenance = broker.task_kind == "self_improvement"
         write_managed_config(settings, broker.url)
         os.environ["OPENAI_API_KEY"] = "penelopa-local"
         os.environ["OPENAI_BASE_URL"] = f"{broker.url}/provider/analysis/v1"
-        install_policy()
+        install_policy(broker.task_kind)
         from hermes_cli.goals import GoalContract, GoalManager
         from hermes_state import SessionDB
         from run_agent import AIAgent
         from tools.mcp_tool import discover_mcp_tools
 
         discovered = set(discover_mcp_tools())
-        if "mcp__penelopa__submit_recommendations" not in discovered:
+        terminal = "complete_self_improvement" if maintenance else "submit_recommendations"
+        if "mcp__penelopa__" + terminal not in discovered:
             raise RuntimeError("required_mcp_discovery_failed")
         brief = broker.call("get_task_brief")
         if str(brief.get("task_id")) != settings.task_id:
@@ -114,8 +122,35 @@ def run(settings):
             skip_background_review=True,
             checkpoints_enabled=False,
         )
-        assert_surface(agent)
+        assert_surface(agent, broker.task_kind)
         state.checkpoint("working", session_id=agent.session_id)
+        try:
+            reporter = Reporter(broker)
+            reporter.start()
+        except (ValueError, OSError, TransportError):
+            if maintenance:
+                raise
+            reporter = None
+            state.checkpoint(error_code="review_report_unavailable")
+
+        if maintenance:
+            history, reporter.native_progress = review_messages(brief, db)
+            run_terminal_review(agent, history, state)
+            if state.stop.is_set() or state.review_status != "completed":
+                raise RuntimeError(state.error_code or "native_review_failed")
+            reporter.finish("completed", True)
+            reporter = None
+            broker.call("complete_self_improvement")
+            if state.accepted is None:
+                raise RuntimeError("maintenance_receipt_missing")
+            state.checkpoint("closing")
+            agent.close()
+            agent = None
+            db.close()
+            db = None
+            state.checkpoint("finished")
+            broker.heartbeat()
+            return 0
 
         def checkpoint_session():
             state.checkpoint(session_id=agent.session_id)
@@ -205,6 +240,12 @@ def run(settings):
         except Exception:
             # Accepted business success is irreversible; maintenance is separate.
             state.checkpoint(review_status="failed", error_code="native_review_failed")
+        if reporter is not None:
+            try:
+                reporter.finish("completed" if state.review_status == "completed" else "error", state.review_status == "completed")
+            except (ValueError, OSError, TransportError):
+                state.checkpoint(error_code="review_report_unavailable")
+            reporter = None
         state.checkpoint("closing")
         agent.close()
         agent = None
@@ -214,6 +255,12 @@ def run(settings):
         broker.heartbeat()
         return 0
     except (CapabilityRevoked, TransportError, RuntimeError, ValueError, OSError) as error:
+        if reporter is not None:
+            try:
+                reporter.finish("budget_exhausted" if state.error_code == "budget_exhausted" else "error", False)
+            except Exception:
+                pass
+            reporter = None
         state.checkpoint(
             "finished" if state.accepted else "failed",
             error_code=type(error).__name__,
@@ -227,6 +274,11 @@ def run(settings):
             pass
         return 0 if state.accepted else 75
     finally:
+        if reporter is not None:
+            try:
+                reporter.finish("budget_exhausted" if state.error_code == "budget_exhausted" else "error", False)
+            except Exception:
+                pass
         watcher_done.set()
         if watcher is not None:
             watcher.join(timeout=1)

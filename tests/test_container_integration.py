@@ -145,6 +145,24 @@ print(json.dumps(files))
         self.finish(case, self.start(case, volume), pause_review=True)
         self.assert_persisted(case, self.inspect_volume(volume))
 
+    def test_idle_self_improvement_persists_without_recommendations(self):
+        case = FixtureCase(str(uuid.uuid4()), "maintenance", maintenance=True)
+        case.release_review.set()
+        volume = self.volume()
+        process = self.start(case, volume)
+        output, _ = process.communicate(timeout=150)
+        self.assertEqual(process.returncode, 0, output + "\nrequests=" + str([(len(json.dumps(r)), r.get("max_tokens")) for r in case.provider_requests]))
+        self.assertEqual(case.terminal_calls, 1, output)
+        self.assertNotIn("submit_recommendations", case.mcp_calls)
+        self.assertIn("complete_self_improvement", case.mcp_calls)
+        self.assertTrue(case.reports[-1]["complete"], output)
+        self.assertEqual(case.reports[-1]["outcome"], "applied")
+        files = self.inspect_volume(volume)
+        self.assertIn(case.review_sentinel, files.get("hermes/memories/MEMORY.md", ""))
+        next_case = FixtureCase(case.user_id, "maintenance-next")
+        self.finish(next_case, self.start(next_case, volume))
+        self.assertIn(case.review_sentinel, json.dumps(next_case.provider_requests))
+
 
 if __name__ == "__main__":
     unittest.main()

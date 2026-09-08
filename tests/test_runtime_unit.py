@@ -68,6 +68,21 @@ class BootstrapUnit(unittest.TestCase):
 
 
 class RuntimeUnit(unittest.TestCase):
+    def test_maintenance_budget_survives_restart_and_bounds_each_call(self):
+        brief = {"task_kind": "self_improvement", "deadline": (datetime.now(timezone.utc) + timedelta(seconds=180)).isoformat(),
+            "budget": {"calls": 2, "input_tokens": 100000, "output_tokens": 8000}}
+        self.broker.configure_task(brief)
+        payload = {"model": "primary", "messages": [{"role": "user", "content": "review"}], "max_tokens": 32000}
+        self.assertEqual(self.broker.reserve_call(payload)["max_tokens"], 2048)
+        self.broker.reserve_call(payload)
+        restarted = Broker(self.settings, self.state)
+        self.addCleanup(restarted.server.server_close)
+        restarted.configure_task(brief)
+        with self.assertRaises(TransportError):
+            restarted.reserve_call(payload)
+        self.assertEqual(self.state.error_code, "budget_exhausted")
+        self.assertNotIn("submit_recommendations", restarted.allowed_tools())
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

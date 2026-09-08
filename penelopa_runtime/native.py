@@ -24,14 +24,16 @@ def permitted(name, args=None):
     return True
 
 
-def install_policy():
+def install_policy(task_kind="recommendation_generation"):
     """Install BEFORE importing run_agent/model_tools or any tool discovery.
 
     The adapter owns exposure/dispatch only. It never replaces Hermes's model
     loop, native handlers, memory store, skill store, goal judge or compactor.
     This revision-pinned seam intentionally fails closed on future API drift.
     """
-    global _installed
+    global _installed, ALLOWED_NAMES
+    if task_kind == "self_improvement":
+        ALLOWED_NAMES = NATIVE_TOOLS | {"mcp__penelopa__get_task_brief", "mcp__penelopa__complete_self_improvement"}
     if _installed:
         return
     import hermes_cli.lifecycle as lifecycle
@@ -102,11 +104,11 @@ def install_policy():
     _installed = True
 
 
-def assert_surface(agent):
+def assert_surface(agent, task_kind="recommendation_generation"):
     names = {tool["function"]["name"] for tool in agent.tools}
     required = NATIVE_TOOLS | {
         "mcp__penelopa__get_task_brief",
-        "mcp__penelopa__submit_recommendations",
+        "mcp__penelopa__complete_self_improvement" if task_kind == "self_improvement" else "mcp__penelopa__submit_recommendations",
     }
     if not required <= names or not names <= ALLOWED_NAMES:
         raise RuntimeError(
