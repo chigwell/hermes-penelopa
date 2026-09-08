@@ -11,6 +11,8 @@ from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
 
+from penelopa_runtime.diagnostics import MAX_EVENTS, OPERATIONS, VERSION, normalize_event
+
 
 def atomic_json(path: Path, value: dict) -> None:
     if path.is_symlink():
@@ -42,6 +44,9 @@ class RuntimeState:
         self.requests = 0
         self.missing_usage_calls = 0
         self.last_model = settings.model
+        self.diagnostic_events = []
+        self.diagnostic_sequence = 0
+        self.operation_counts = {}
         self.path = settings.home.parent / "runtime.json"
         self.restore_attempt_metrics()
 
@@ -51,6 +56,8 @@ class RuntimeState:
         if not self.path.exists():
             return
         previous = json.loads(self.path.read_text())
+        if not isinstance(previous, dict):
+            raise ValueError("Invalid runtime checkpoint")
         if any(
             previous.get(key) != getattr(self.settings, key)
             for key in ("task_id", "user_id", "claim_version")
@@ -64,9 +71,11 @@ class RuntimeState:
         for metric in metrics:
             if (
                 not isinstance(metric, dict)
-                or metric.get("stage") not in stages
-                or metric.get("model") not in models
-                or not isinstance(metric.get("duration_seconds"), (int, float))
+                or not isinstance(metric.get("stage"), str)
+                or metric["stage"] not in stages
+                or not isinstance(metric.get("model"), str)
+                or metric["model"] not in models
+                or type(metric.get("duration_seconds")) not in (int, float)
                 or not math.isfinite(metric["duration_seconds"])
                 or metric["duration_seconds"] < 0
             ):
@@ -77,10 +86,28 @@ class RuntimeState:
             if not isinstance(value, int) or value < 0:
                 raise ValueError("Invalid runtime request checkpoint")
             setattr(self, "requests" if key == "llm_requests" else key, value)
-        if previous.get("provider_model") in models:
+        if isinstance(previous.get("provider_model"), str) and previous["provider_model"] in models:
             self.last_model = previous["provider_model"]
         if previous.get("review_status") == "completed":
             self.review_status = "completed"
+        events = previous.get("diagnostic_events", [])
+        if not isinstance(events, list) or len(events) > MAX_EVENTS:
+            raise ValueError("Invalid runtime diagnostic checkpoint")
+        sequence = -1
+        for item in events:
+            event = normalize_event(item)
+            if event is None or event["sequence"] <= sequence:
+                raise ValueError("Invalid runtime diagnostic checkpoint")
+            self.diagnostic_events.append(event)
+            sequence = event["sequence"]
+        self.diagnostic_sequence = sequence + 1
+        operation_counts = previous.get("operation_counts", {})
+        if not isinstance(operation_counts, dict) or len(operation_counts) > len(OPERATIONS):
+            raise ValueError("Invalid runtime operation checkpoint")
+        for operation, count in operation_counts.items():
+            if operation not in OPERATIONS or type(count) is not int or not 0 <= count <= 1_000_000:
+                raise ValueError("Invalid runtime operation checkpoint")
+        self.operation_counts = deepcopy(operation_counts)
 
     def snapshot(self):
         with self.lock:
@@ -100,6 +127,9 @@ class RuntimeState:
                 "missing_usage_calls": self.missing_usage_calls,
                 "provider_model": self.last_model,
                 "error_code": self.error_code,
+                "diagnostics_version": VERSION,
+                "diagnostic_events": deepcopy(self.diagnostic_events),
+                "operation_counts": deepcopy(self.operation_counts),
             }
 
     def checkpoint(self, phase=None, **fields):
@@ -150,6 +180,55 @@ class RuntimeState:
                         target[key] += value
                 metric["usage"] = target
             self.checkpoint()
+
+    def record_diagnostic_event(self, kind, status, **fields):
+        """Append one bounded, schema-validated non-content fact and checkpoint it.
+
+        This is intentionally the only way runtime code can add the event.  It
+        prevents a provider reply, an MCP argument, or a raw exception from
+        being copied wholesale into the persistent user volume.
+        """
+
+        with self.lock:
+            event = normalize_event(
+                {
+                    "sequence": self.diagnostic_sequence,
+                    "kind": kind,
+                    "status": status,
+                    **fields,
+                }
+            )
+            if event is None:
+                raise ValueError("Invalid native diagnostic event")
+            self.diagnostic_sequence += 1
+            self.diagnostic_events.append(event)
+            if len(self.diagnostic_events) > MAX_EVENTS:
+                self.diagnostic_events = self.diagnostic_events[-MAX_EVENTS:]
+            operation = event.get("operation")
+            count = event.get("count")
+            if isinstance(operation, str) and type(count) is int:
+                self.operation_counts[operation] = max(self.operation_counts.get(operation, 0), count)
+            try:
+                atomic_json(self.path, self.snapshot())
+            except OSError:
+                # Diagnostics must never turn a provider/MCP outcome into a
+                # crash merely because an otherwise recoverable volume write
+                # failed. Keep the bounded fact in memory for a later regular
+                # checkpoint if the volume recovers.
+                pass
+            return deepcopy(event)
+
+    def next_operation_count(self, operation):
+        """Reserve a claim-persistent monotonically increasing operation count."""
+
+        if operation not in OPERATIONS:
+            raise ValueError("Invalid native diagnostic operation")
+        with self.lock:
+            current = self.operation_counts.get(operation, 0)
+            if current >= 1_000_000:
+                raise ValueError("Native diagnostic operation count exhausted")
+            self.operation_counts[operation] = current + 1
+            return current + 1
 
     def terminal_meta(self):
         snapshot = self.snapshot()

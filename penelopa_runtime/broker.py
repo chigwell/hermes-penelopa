@@ -14,7 +14,17 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from penelopa_runtime import MCP_TOOLS
+from penelopa_runtime.diagnostics import provider_request_id_from_headers
 from penelopa_runtime.state import atomic_json
+
+_HEARTBEAT_FAILURE_LIMIT = 3
+_NON_RETRYABLE_FAILURE_CODES = frozenset(
+    {
+        "provider_request_rejected",
+        "budget_exhausted",
+        "mcp_heartbeat_limit_exhausted",
+    }
+)
 
 
 class CapabilityRevoked(RuntimeError):
@@ -22,9 +32,27 @@ class CapabilityRevoked(RuntimeError):
 
 
 class TransportError(RuntimeError):
-    def __init__(self, code):
+    """A bounded transport classification; never carry a response body."""
+
+    def __init__(
+        self,
+        code,
+        *,
+        http_status=None,
+        provider_request_id=None,
+    ):
         super().__init__(str(code))
         self.code = str(code)
+        self.http_status = (
+            http_status
+            if type(http_status) is int and 100 <= http_status <= 599
+            else None
+        )
+        # The transport subprocess emits this only from a fixed header allowlist.
+        # Keep it opaque here; the diagnostics boundary validates it again.
+        self.provider_request_id = (
+            provider_request_id if isinstance(provider_request_id, str) else None
+        )
 
 
 def exchange(url, token, payload=None, *, timeout=30, method="POST", headers=None):
@@ -57,7 +85,11 @@ def exchange(url, token, payload=None, *, timeout=30, method="POST", headers=Non
             raise TransportError("transport_unavailable")
         result = json.loads(completed.stdout)
         if result.get("error"):
-            raise TransportError(result["error"])
+            raise TransportError(
+                result["error"],
+                http_status=result.get("http_status"),
+                provider_request_id=result.get("provider_request_id"),
+            )
         return result["status"], result["headers"], base64.b64decode(result["body"], validate=True)
     except (OSError, subprocess.TimeoutExpired, ValueError, KeyError):
         raise TransportError("transport_unavailable") from None
@@ -192,32 +224,118 @@ class Broker:
             raise TransportError("invalid_lifecycle_response")
         return result
 
+    def _terminal_state(self):
+        if self.state.accepted is not None:
+            return "accepted"
+        if self.state.phase == "terminal_pending":
+            return "pending"
+        return "not_started"
+
+    def _record_terminal_event(
+        self,
+        status,
+        *,
+        operation,
+        count,
+        terminal_state=None,
+        mcp_tool=None,
+        started_at=None,
+        error_code=None,
+        http_status=None,
+        retryable=None,
+    ):
+        fields = {"operation": operation, "count": count}
+        if terminal_state is not None:
+            fields["terminal_state"] = terminal_state
+        if mcp_tool is not None:
+            fields["mcp_tool"] = mcp_tool
+        if started_at is not None:
+            fields["duration_ms"] = max(0, int((time.monotonic() - started_at) * 1000))
+        if error_code is not None:
+            fields["error_code"] = error_code
+        if http_status is not None:
+            fields["http_status"] = http_status
+        if retryable is not None:
+            fields["retryable"] = retryable
+        self.state.record_diagnostic_event("terminal", status, **fields)
+
     def receipt(self):
-        result = self.lifecycle("receipt", method="GET")
-        if (
-            str(result.get("task_id")) != self.settings.task_id
-            or int(result.get("claim_version", -1)) != self.settings.claim_version
-        ):
-            self.state.stop.set()
-            raise CapabilityRevoked("receipt_claim_mismatch")
-        if result.get("accepted") is True and result.get("status") == "SUCCEEDED":
-            receipt = result.get("receipt")
-            if not isinstance(receipt, dict):
-                raise TransportError("invalid_terminal_receipt")
-            self.state.checkpoint("terminal_accepted", accepted=receipt)
-            atomic_json(
-                self.pending_path,
-                {
-                    "task_id": self.settings.task_id,
-                    "claim_version": self.settings.claim_version,
-                    "accepted": True,
-                },
+        count = self.state.next_operation_count("terminal_receipt")
+        started_at = time.monotonic()
+        self._record_terminal_event(
+            "started",
+            operation="terminal_receipt",
+            count=count,
+            terminal_state=self._terminal_state(),
+        )
+        try:
+            result = self.lifecycle("receipt", method="GET")
+            if (
+                str(result.get("task_id")) != self.settings.task_id
+                or int(result.get("claim_version", -1)) != self.settings.claim_version
+            ):
+                self.state.stop.set()
+                raise CapabilityRevoked("receipt_claim_mismatch")
+            if result.get("accepted") is True and result.get("status") == "SUCCEEDED":
+                receipt = result.get("receipt")
+                if not isinstance(receipt, dict):
+                    raise TransportError("invalid_terminal_receipt")
+                self.state.checkpoint("terminal_accepted", accepted=receipt)
+                atomic_json(
+                    self.pending_path,
+                    {
+                        "task_id": self.settings.task_id,
+                        "claim_version": self.settings.claim_version,
+                        "accepted": True,
+                    },
+                )
+                self._record_terminal_event(
+                    "completed",
+                    operation="terminal_receipt",
+                    count=count,
+                    terminal_state="accepted",
+                    started_at=started_at,
+                )
+                return receipt
+            if result.get("status") in {"FAILED", "CANCELLED"}:
+                self.state.stop.set()
+                raise CapabilityRevoked("task_no_longer_active")
+            self._record_terminal_event(
+                "completed",
+                operation="terminal_receipt",
+                count=count,
+                terminal_state=self._terminal_state(),
+                started_at=started_at,
             )
-            return receipt
-        if result.get("status") in {"FAILED", "CANCELLED"}:
-            self.state.stop.set()
-            raise CapabilityRevoked("task_no_longer_active")
-        return None
+            return None
+        except CapabilityRevoked:
+            self._record_terminal_event(
+                "rejected",
+                operation="terminal_receipt",
+                count=count,
+                terminal_state="rejected",
+                started_at=started_at,
+                error_code="claim_capability_revoked",
+                retryable=False,
+            )
+            raise
+        except (TransportError, ValueError, TypeError) as error:
+            if isinstance(error, TransportError):
+                error_code, http_status = error.code, error.http_status
+                retryable = self._retryable_transport_error(error_code)
+            else:
+                error_code, http_status, retryable = "terminal_receipt_invalid", None, False
+            self._record_terminal_event(
+                "failed",
+                operation="terminal_receipt",
+                count=count,
+                terminal_state="receipt_unknown",
+                started_at=started_at,
+                error_code=error_code,
+                http_status=http_status,
+                retryable=retryable,
+            )
+            raise
 
     def await_initial_lease(self):
         while not self.lease_ready.wait(0.1):
@@ -255,67 +373,242 @@ class Broker:
                 self.state.stop.set()
                 return
 
+    @staticmethod
+    def _retryable_transport_error(code):
+        if code in {"transport_unavailable", "http_408", "http_429"}:
+            return True
+        if isinstance(code, str) and code.startswith("http_"):
+            try:
+                return 500 <= int(code[5:]) < 600
+            except ValueError:
+                return False
+        return False
+
+    def _record_heartbeat_event(
+        self,
+        status,
+        *,
+        operation,
+        count,
+        started_at=None,
+        error_code=None,
+        http_status=None,
+        retryable=None,
+    ):
+        fields = {
+            "operation": operation,
+            "count": count,
+        }
+        if operation == "mcp_lease_heartbeat":
+            fields["mcp_tool"] = "heartbeat_task"
+        if started_at is not None:
+            fields["duration_ms"] = max(0, int((time.monotonic() - started_at) * 1000))
+        if error_code is not None:
+            fields["error_code"] = error_code
+        if http_status is not None:
+            fields["http_status"] = http_status
+        if retryable is not None:
+            fields["retryable"] = retryable
+        self.state.record_diagnostic_event("heartbeat", status, **fields)
+
+    @staticmethod
+    def _heartbeat_error_details(error, fallback):
+        if isinstance(error, TransportError):
+            return error.code, error.http_status
+        return fallback, None
+
     def heartbeat(self):
+        count = self.state.next_operation_count("lifecycle_telemetry")
+        started_at = time.monotonic()
+        self._record_heartbeat_event(
+            "started",
+            operation="lifecycle_telemetry",
+            count=count,
+        )
         snapshot = self.state.snapshot()
-        return self.lifecycle(
-            "runtime-heartbeat",
-            {
-                key: snapshot[key]
-                for key in (
-                    "claim_version",
-                    "runtime_phase",
-                    "session_id",
+        try:
+            result = self.lifecycle(
+                "runtime-heartbeat",
+                {
+                    key: snapshot[key]
+                    for key in (
+                        "claim_version",
+                        "runtime_phase",
+                        "session_id",
                     "generation_stages",
                     "review_status",
                     "error_code",
                     "llm_requests",
                     "missing_usage_calls",
+                    "terminal_accepted",
+                    "provider_model",
+                    "diagnostics_version",
+                    "diagnostic_events",
                 )
-            },
-            timeout=min(self.settings.internal_timeout, 30),
+                },
+                timeout=min(self.settings.internal_timeout, 30),
+            )
+        except CapabilityRevoked:
+            self._record_heartbeat_event(
+                "rejected",
+                operation="lifecycle_telemetry",
+                count=count,
+                started_at=started_at,
+                error_code="claim_capability_revoked",
+                retryable=False,
+            )
+            raise
+        except (TransportError, ValueError) as error:
+            error_code, http_status = self._heartbeat_error_details(
+                error, "lifecycle_telemetry_failed"
+            )
+            self._record_heartbeat_event(
+                "failed",
+                operation="lifecycle_telemetry",
+                count=count,
+                started_at=started_at,
+                error_code=error_code,
+                http_status=http_status,
+                retryable=self._retryable_transport_error(error_code),
+            )
+            raise
+        self._record_heartbeat_event(
+            "completed",
+            operation="lifecycle_telemetry",
+            count=count,
+            started_at=started_at,
         )
+        return result
+
+    def _renew_mcp_lease(self):
+        """Renew the data/claim lease independently from lifecycle telemetry."""
+
+        count = self.state.next_operation_count("mcp_lease_heartbeat")
+        if count > self.settings.mcp_max_heartbeats:
+            self._record_heartbeat_event(
+                "rejected",
+                operation="mcp_lease_heartbeat",
+                count=count,
+                error_code="mcp_heartbeat_limit_exhausted",
+                retryable=False,
+            )
+            self.state.checkpoint(error_code="mcp_heartbeat_limit_exhausted")
+            self.state.stop.set()
+            return False
+
+        started_at = time.monotonic()
+        self._record_heartbeat_event(
+            "started",
+            operation="mcp_lease_heartbeat",
+            count=count,
+        )
+        try:
+            response = self.remote_rpc(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "heartbeat",
+                    "method": "tools/call",
+                    "params": {"name": "heartbeat_task", "arguments": {}},
+                },
+                timeout=min(self.settings.internal_timeout, 30),
+            )
+            if (
+                not isinstance(response, dict)
+                or "error" in response
+                or not isinstance(response.get("result"), dict)
+                or response["result"].get("isError")
+            ):
+                if self.receipt() is None:
+                    raise TransportError("task_heartbeat_rejected")
+            else:
+                self.update_task_lease(response)
+        except CapabilityRevoked:
+            self._record_heartbeat_event(
+                "rejected",
+                operation="mcp_lease_heartbeat",
+                count=count,
+                started_at=started_at,
+                error_code="claim_capability_revoked",
+                retryable=False,
+            )
+            raise
+        except (TransportError, ValueError) as error:
+            # A revoked data capability can be expected after a terminal ACK.
+            accepted_after_revoke = False
+            if (
+                isinstance(error, TransportError)
+                and error.code in {"http_401", "http_403"}
+            ):
+                try:
+                    accepted_after_revoke = self.receipt() is not None
+                except CapabilityRevoked:
+                    self._record_heartbeat_event(
+                        "rejected",
+                        operation="mcp_lease_heartbeat",
+                        count=count,
+                        started_at=started_at,
+                        error_code="claim_capability_revoked",
+                        retryable=False,
+                    )
+                    raise
+            if accepted_after_revoke:
+                self._record_heartbeat_event(
+                    "rejected",
+                    operation="mcp_lease_heartbeat",
+                    count=count,
+                    started_at=started_at,
+                    error_code=error.code,
+                    http_status=error.http_status,
+                    retryable=False,
+                )
+                return True
+            error_code, http_status = self._heartbeat_error_details(
+                error, "mcp_lease_heartbeat_failed"
+            )
+            self._record_heartbeat_event(
+                "failed",
+                operation="mcp_lease_heartbeat",
+                count=count,
+                started_at=started_at,
+                error_code=error_code,
+                http_status=http_status,
+                retryable=self._retryable_transport_error(error_code),
+            )
+            raise
+        self._record_heartbeat_event(
+            "completed",
+            operation="mcp_lease_heartbeat",
+            count=count,
+            started_at=started_at,
+        )
+        return True
 
     def heartbeat_loop(self):
-        consecutive_failures = 0
+        mcp_lease_failures = 0
         while not self.done.is_set():
+            if self.state.accepted is None:
+                try:
+                    if not self._renew_mcp_lease():
+                        return
+                except CapabilityRevoked:
+                    return
+                except (TransportError, ValueError):
+                    mcp_lease_failures += 1
+                    if mcp_lease_failures >= _HEARTBEAT_FAILURE_LIMIT:
+                        self.state.checkpoint(error_code="mcp_lease_heartbeat_unavailable")
+                        self.state.stop.set()
+                        return
+                    self.done.wait(self.settings.heartbeat_interval)
+                    continue
+                mcp_lease_failures = 0
             try:
-                if self.state.accepted is None:
-                    try:
-                        response = self.remote_rpc(
-                            {
-                                "jsonrpc": "2.0",
-                                "id": "heartbeat",
-                                "method": "tools/call",
-                                "params": {"name": "heartbeat_task", "arguments": {}},
-                            },
-                            timeout=min(self.settings.internal_timeout, 30),
-                        )
-                        if (
-                            not isinstance(response, dict)
-                            or "error" in response
-                            or not isinstance(response.get("result"), dict)
-                            or response["result"].get("isError")
-                        ):
-                            if self.receipt() is None:
-                                raise TransportError("task_heartbeat_rejected")
-                        else:
-                            self.update_task_lease(response)
-                    except TransportError as error:
-                        if error.code in {"http_401", "http_403"} and self.receipt() is not None:
-                            pass
-                        else:
-                            raise
+                # Lifecycle telemetry is diagnostic-only; a fresh MCP lease must
+                # not be killed merely because the telemetry endpoint is down.
                 self.heartbeat()
-                self.state.checkpoint()
-                consecutive_failures = 0
             except CapabilityRevoked:
                 return
             except (TransportError, ValueError):
-                consecutive_failures += 1
-                if consecutive_failures >= 3:
-                    self.state.checkpoint(error_code="heartbeat_unavailable")
-                    self.state.stop.set()
-                    return
+                pass
             self.done.wait(self.settings.heartbeat_interval)
 
     def remote_rpc(self, message, timeout=None):
@@ -394,6 +687,15 @@ class Broker:
         with self.terminal_lock:
             if self.state.accepted is not None:
                 return self.cached_terminal(request_id)
+            count = self.state.next_operation_count("terminal_submission")
+            started_at = time.monotonic()
+            self._record_terminal_event(
+                "started",
+                operation="terminal_submission",
+                count=count,
+                terminal_state="pending",
+                mcp_tool=name,
+            )
             self.state.checkpoint("terminal_pending")
             atomic_json(
                 self.pending_path,
@@ -406,12 +708,31 @@ class Broker:
             outgoing["params"]["_meta"] = self.state.terminal_meta()
             try:
                 response = self.remote_rpc(outgoing)
-            except TransportError:
+            except TransportError as error:
                 # A timed-out terminal POST may already be committed. Never replay
                 # it until claim-bound receipt readback has established the state.
                 if self.receipt() is not None:
+                    self._record_terminal_event(
+                        "completed",
+                        operation="terminal_submission",
+                        count=count,
+                        terminal_state="accepted",
+                        mcp_tool=name,
+                        started_at=started_at,
+                    )
                     return self.cached_terminal(request_id)
                 self.state.checkpoint("working")
+                self._record_terminal_event(
+                    "timeout",
+                    operation="terminal_submission",
+                    count=count,
+                    terminal_state="receipt_unknown",
+                    mcp_tool=name,
+                    started_at=started_at,
+                    error_code=error.code,
+                    http_status=error.http_status,
+                    retryable=self._retryable_transport_error(error.code),
+                )
                 return rpc_error(
                     request_id, "Terminal receipt not accepted; revalidate before retry"
                 )
@@ -422,9 +743,38 @@ class Broker:
             ):
                 # The receipt endpoint, not generated text, is authoritative.
                 if self.receipt() is not None:
+                    self._record_terminal_event(
+                        "completed",
+                        operation="terminal_submission",
+                        count=count,
+                        terminal_state="accepted",
+                        mcp_tool=name,
+                        started_at=started_at,
+                    )
                     return response
+                self.state.checkpoint("working")
+                self._record_terminal_event(
+                    "rejected",
+                    operation="terminal_submission",
+                    count=count,
+                    terminal_state="receipt_unknown",
+                    mcp_tool=name,
+                    started_at=started_at,
+                    error_code="terminal_receipt_unconfirmed",
+                    retryable=True,
+                )
                 return rpc_error(request_id, "Terminal receipt has not been confirmed")
             self.state.checkpoint("working")
+            self._record_terminal_event(
+                "rejected",
+                operation="terminal_submission",
+                count=count,
+                terminal_state="rejected",
+                mcp_tool=name,
+                started_at=started_at,
+                error_code="terminal_submission_rejected",
+                retryable=True,
+            )
             return response
 
     def cached_terminal(self, request_id):
@@ -447,6 +797,37 @@ class Broker:
         with self.budget_lock:
             return self._provider(path, payload)
 
+    def _record_provider_event(
+        self,
+        status,
+        *,
+        stage,
+        model,
+        count,
+        started_at=None,
+        error_code=None,
+        http_status=None,
+        provider_request_id=None,
+        retryable=None,
+    ):
+        fields = {
+            "stage": stage,
+            "model": model,
+            "operation": "provider_request",
+            "count": count,
+        }
+        if started_at is not None:
+            fields["duration_ms"] = max(0, int((time.monotonic() - started_at) * 1000))
+        if error_code is not None:
+            fields["error_code"] = error_code
+        if http_status is not None:
+            fields["http_status"] = http_status
+        if provider_request_id is not None:
+            fields["provider_request_id"] = provider_request_id
+        if retryable is not None:
+            fields["retryable"] = retryable
+        self.state.record_diagnostic_event("provider", status, **fields)
+
     def _provider(self, path, payload):
         if self.state.stop.is_set():
             raise TransportError("task_interrupted")
@@ -465,11 +846,29 @@ class Broker:
             raise TransportError("provider_model_denied")
         models = [payload["model"], *self.settings.fallback_models]
         for model in dict.fromkeys(models):
-            reserved_before = dict(self.reserved)
-            outgoing = self.reserve_call({**payload, "model": model})
+            count = self.state.next_operation_count("provider_request")
             started = time.monotonic()
+            self._record_provider_event(
+                "started", stage=stage, model=model, count=count
+            )
+            reserved_before = dict(self.reserved)
             try:
-                _, headers, raw = exchange(
+                outgoing = self.reserve_call({**payload, "model": model})
+            except TransportError as error:
+                self._record_provider_event(
+                    "rejected",
+                    stage=stage,
+                    model=model,
+                    count=count,
+                    started_at=started,
+                    error_code=error.code,
+                    http_status=error.http_status,
+                    provider_request_id=error.provider_request_id,
+                    retryable=False,
+                )
+                raise
+            try:
+                http_status, headers, raw = exchange(
                     f"{self.settings.provider_base}/chat/completions",
                     self.settings.provider_token,
                     outgoing,
@@ -477,12 +876,32 @@ class Broker:
                     headers={"X-Penelopa-Stage": stage},
                 )
             except TransportError as error:
-                self.state.record(stage, model, time.monotonic() - started, error=error.code)
-                retryable = error.code in {"transport_unavailable", "http_408", "http_429"}
-                if error.code.startswith("http_"):
-                    retryable = retryable or 500 <= int(error.code[5:]) < 600
+                retryable = self._retryable_transport_error(error.code)
+                # Establish the durable task classification in memory before an
+                # aggregate usage checkpoint can fail. The diagnostic event is
+                # itself best-effort, so a volume I/O fault cannot replace a
+                # provider 4xx with an opaque OSError during outer unwinding.
                 if not retryable:
-                    self.state.checkpoint(error_code="provider_request_rejected")
+                    self.state.error_code = "provider_request_rejected"
+                self._record_provider_event(
+                    "failed" if retryable else "rejected",
+                    stage=stage,
+                    model=model,
+                    count=count,
+                    started_at=started,
+                    error_code=error.code,
+                    http_status=error.http_status,
+                    provider_request_id=error.provider_request_id,
+                    retryable=retryable,
+                )
+                try:
+                    self.state.record(stage, model, time.monotonic() - started, error=error.code)
+                except OSError:
+                    # Usage aggregation is diagnostic accounting. It must not
+                    # mask the original provider classification on a degraded
+                    # state volume after the safe event has been captured.
+                    pass
+                if not retryable:
                     self.state.stop.set()
                     raise
                 continue
@@ -496,7 +915,21 @@ class Broker:
                             usage = json.loads(line[5:]).get("usage") or usage
             except (ValueError, AttributeError):
                 pass
-            self.state.record(stage, model, time.monotonic() - started, usage=usage)
+            self._record_provider_event(
+                "completed",
+                stage=stage,
+                model=model,
+                count=count,
+                started_at=started,
+                http_status=http_status,
+                provider_request_id=provider_request_id_from_headers(headers),
+            )
+            try:
+                self.state.record(stage, model, time.monotonic() - started, usage=usage)
+            except OSError:
+                # The provider response remains valid even if optional
+                # aggregate accounting cannot be flushed right now.
+                pass
             if self.budget and isinstance(usage, dict) and all(type(usage.get(k)) is int and usage[k] >= 0 for k in ("prompt_tokens", "completion_tokens")):
                 reported_input = usage["prompt_tokens"]
                 total = usage.get("total_tokens")
@@ -524,6 +957,13 @@ class Broker:
         # terminal operation. This capability stays separate from model tools.
         if self.receipt() is not None:
             return
+        snapshot = self.state.snapshot()
+        if snapshot.get("terminal_accepted"):
+            terminal_state = "accepted"
+        elif snapshot.get("runtime_phase") == "terminal_pending":
+            terminal_state = "pending"
+        else:
+            terminal_state = "not_started"
         self.remote_rpc(
             {
                 "jsonrpc": "2.0",
@@ -535,8 +975,12 @@ class Broker:
                         "error_type": "hermes_runtime_error",
                         "error_code": error_code[:128],
                         "message": "Managed Hermes runtime stopped before terminal acceptance.",
-                        "retryable": True,
-                        "details": {"runtime_phase": self.state.phase},
+                        "retryable": error_code not in _NON_RETRYABLE_FAILURE_CODES,
+                        "details": {
+                            "runtime_phase": snapshot["runtime_phase"],
+                            "diagnostic_events": snapshot["diagnostic_events"],
+                            "terminal_state": terminal_state,
+                        },
                     },
                 },
             }

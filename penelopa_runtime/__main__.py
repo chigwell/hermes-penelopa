@@ -11,6 +11,7 @@ from uuid import uuid4
 
 from penelopa_runtime.broker import Broker, CapabilityRevoked, TransportError
 from penelopa_runtime.config import Settings, bootstrap, write_managed_config
+from penelopa_runtime.diagnostics import safe_error_code
 from penelopa_runtime.improvement import Reporter, review_messages
 from penelopa_runtime.native import assert_surface, install_policy, run_terminal_review
 from penelopa_runtime.state import RuntimeState, atomic_json
@@ -261,15 +262,27 @@ def run(settings):
             except Exception:
                 pass
             reporter = None
-        state.checkpoint(
-            "finished" if state.accepted else "failed",
-            error_code=type(error).__name__,
-            review_status="failed" if state.accepted else state.review_status,
+        # A provider/lease checkpoint is the most precise safe cause we have.
+        # Do not replace it with the outer exception class while unwinding.
+        failure_code = (
+            safe_error_code(state.error_code)
+            or safe_error_code(type(error).__name__)
+            or "native_runtime_failed"
         )
-        code = str(error) if isinstance(error, RuntimeError) else type(error).__name__
-        print("Penelopa runtime stopped: " + code[:128], flush=True)
         try:
-            broker.report_failure(state.error_code or "native_runtime_failed")
+            state.checkpoint(
+                "finished" if state.accepted else "failed",
+                error_code=failure_code,
+                review_status="failed" if state.accepted else state.review_status,
+            )
+        except OSError:
+            # The safe in-memory checkpoint may still be relayed by
+            # report_failure; never abandon that path due to a second failed
+            # write while handling the original volume error.
+            pass
+        print("Penelopa runtime stopped: " + failure_code, flush=True)
+        try:
+            broker.report_failure(failure_code)
         except (CapabilityRevoked, TransportError):
             pass
         return 0 if state.accepted else 75

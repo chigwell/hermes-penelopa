@@ -36,6 +36,7 @@ class Settings:
     internal_timeout: float = 30
     provider_timeout: float = 180
     heartbeat_interval: float = 15
+    mcp_max_heartbeats: int = 360
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -72,6 +73,7 @@ class Settings:
             internal_timeout=float(os.environ.get("HERMES_INTERNAL_HTTP_TIMEOUT_SECONDS", "30")),
             provider_timeout=float(os.environ.get("HERMES_PROVIDER_HTTP_TIMEOUT_SECONDS", "180")),
             heartbeat_interval=float(os.environ.get("HERMES_HEARTBEAT_INTERVAL_SECONDS", "15")),
+            mcp_max_heartbeats=int(os.environ.get("HERMES_MCP_MAX_HEARTBEATS", "360")),
         )
         if settings.claim_version < 1 or any(
             not math.isfinite(value) or value <= 0
@@ -80,8 +82,8 @@ class Settings:
                 settings.provider_timeout,
                 settings.heartbeat_interval,
             )
-        ):
-            raise ValueError("Claim version and per-request timeouts must be positive")
+        ) or not 1 <= settings.mcp_max_heartbeats <= 1_000:
+            raise ValueError("Claim version, heartbeat limit, and per-request timeouts must be valid")
         # Neither stdio children nor native persistence may inherit external secrets.
         for name in list(os.environ):
             upper = name.upper()

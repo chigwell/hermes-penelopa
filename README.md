@@ -56,8 +56,9 @@ Required environment variables, provided by the trusted task launcher:
 `HERMES_FALLBACK_MODELS` is an optional JSON array of up to two additional models
 at the same provider. `HERMES_HOME` defaults to `/opt/data/hermes`. Transport settings
 are `HERMES_INTERNAL_HTTP_TIMEOUT_SECONDS`, `HERMES_PROVIDER_HTTP_TIMEOUT_SECONDS`
-and `HERMES_HEARTBEAT_INTERVAL_SECONDS`; they are per-request/liveness guards, not
-cumulative generation budgets. Never bake credentials into an image or put them in
+and `HERMES_HEARTBEAT_INTERVAL_SECONDS`; `HERMES_MCP_MAX_HEARTBEATS` bounds MCP
+lease renewals for one claim and survives a same-claim container restart. These
+are per-request/liveness guards, not cumulative generation budgets. Never bake credentials into an image or put them in
 the persistent Hermes config, skills or memory. Launch environment values are
 removed before native Hermes and MCP subprocesses start.
 
@@ -69,6 +70,13 @@ The queue must reserve the execution slot and user volume until physical exit,
 even when the business task is already marked successful.
 
 Non-secret runtime diagnostics are atomically written to `/opt/data/runtime.json`.
+`native-runtime-diagnostics-v1` retains at most 32 claim-scoped events and only
+allowlisted facts: operation/stage/model, duration, safe error code, HTTP status,
+an allowlisted provider request ID, retryability and terminal state. It records
+provider, terminal receipt/submission, MCP lease and lifecycle telemetry events
+separately. It never retains prompt text, provider/MCP response bodies, URLs, raw
+headers, exception messages or credentials. Lifecycle telemetry failures are
+diagnostic-only; they cannot consume the MCP lease-failure budget.
 An interrupted terminal exchange is reconciled with the backend before any replay.
 Stopping uses SIGTERM and graceful shutdown; a forced kill is an exceptional
 recovery operation, never the normal post-success path. Do not run a gateway,
